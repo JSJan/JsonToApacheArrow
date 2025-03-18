@@ -1,4 +1,4 @@
-from fastapi import FastAPI,Request, HTTPException
+from fastapi import FastAPI,Request, HTTPException, Response
 from pydantic import BaseModel
 from typing import List
 import pandas as pd
@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 from fastapi.responses import StreamingResponse
 from s3fs import S3FileSystem
 from pyarrow import ipc
+import io
 
 app = FastAPI()
 
@@ -62,7 +63,7 @@ async def download_data(filename: str):
 
 
 @app.post("/jsonData/upload/")
-async def upload_data(request: Request):
+async def upload_data_json(request: Request):
     """
     Upload JSON data as a Parquet file to S3.
     """
@@ -84,7 +85,7 @@ async def upload_data(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/apacheArrow/download/")
-async def download_data(filename: str):
+async def download_data_json(filename: str):
     """
     Download a Parquet file from S3 and return it as an Apache Arrow Table.
     """
@@ -155,3 +156,47 @@ def arrow_response_to_json(response_content: bytes) -> str:
         return json_output
     except Exception as e:
         raise ValueError(f"Error deserializing Arrow data to JSON: {e}")
+
+
+
+def create_varying_column_tables():
+    data1 = {'col1': [1, 2, 3], 'col3': ['a', 'b', 'c']}
+    data2 = {'col1': [4, 5, 6], 'col4': ['d', 'e', 'f']}
+    table1 = pa.table(data1)
+    table2 = pa.table(data2)
+    return table1, table2
+
+def stream_arrow_tables_separately(tables):
+    buffers = []
+    for table in tables:
+        buffer_output_stream = pa.BufferOutputStream()
+        with ipc.RecordBatchStreamWriter(buffer_output_stream, table.schema) as writer:
+            writer.write_table(table)
+        buffers.append(buffer_output_stream.getvalue())  # Store pyarrow.Buffer of each Arrow stream
+    return buffers
+
+@app.get("/download-multipart")
+def download_multipart():
+    boundary = "boundary123"
+    table1, table2 = create_varying_column_tables()
+    streamed_data = stream_arrow_tables_separately([table1, table2])
+
+    # Build the multipart response
+    multipart_data = b""
+    for i, buffer in enumerate(streamed_data):
+        multipart_data += (
+            f"--{boundary}\r\n"
+            f"Content-Type: application/vnd.apache.arrow.stream\r\n"
+            f"Content-Disposition: attachment; filename=data{i + 1}.arrow\r\n\r\n"
+        ).encode() + buffer.to_pybytes() + b"\r\n"
+
+    multipart_data += f"--{boundary}--\r\n".encode()
+
+    return Response(
+        content=multipart_data,
+        media_type=f"multipart/mixed; boundary={boundary}"
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
